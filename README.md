@@ -5,23 +5,23 @@
 
 작은 운영체제를 처음부터 단계별로 구축.
 
-
-책의 목차
-Intro
-Getting Started
-RISC-V 101
-Overview
-Boot
-Hello World!
-C Standard Library
-Kernel Panic
-Exception
-Memory Allocation
-Process
-Page Table
-Application
-User Mode
-System Call
-Disk I/O
-File System
-Outro
+---
+## 책의 목차
+1. Intro
+2. Getting Started
+3. RISC-V 101
+4. Overview
+5. Boot
+6. Hello World!
+7. C Standard Library
+8. Kernel Panic
+9. Exception
+10. Memory Allocation
+11. Process
+12. Page Table
+13. Application
+14. User Mode
+15. System Call
+16. Disk I/O
+17. File System
+18. Outro
