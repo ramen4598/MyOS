@@ -256,11 +256,6 @@ paddr_t alloc_pages(uint32_t n) {
 
 /////////////////////////////////////////////////////////////////////////////////////
 
-void delay(void) {
-  for (int i = 0; i < 30000000; i++)
-    __asm__ __volatile__("nop"); // do nothing
-}
-
 struct process *proc_a;
 struct process *proc_b;
 
