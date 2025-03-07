@@ -4,7 +4,8 @@
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 
-extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[];
+extern char __kernel_base[], __bss[], __bss_end[], __stack_top[], __free_ram[],
+    __free_ram_end[];
 
 struct process procs[PROCS_MAX]; // 모든 프로세스 제어 구조체 배열
 struct process *current_proc;    // 현재 실행 중인 프로세스
@@ -53,43 +54,6 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
       "ret\n");
 }
 
-struct process *create_process(uint32_t pc) {
-  // 미사용(UNUSED) 상태의 프로세스 구조체 찾기
-  struct process *proc = NULL;
-  int i;
-  for (i = 0; i < PROCS_MAX; i++) {
-    if (procs[i].state == PROC_UNUSED) {
-      proc = &procs[i];
-      break;
-    }
-  }
-
-  if (!proc)
-    PANIC("no free process slots");
-
-  // 커널 스택에 callee-saved 레지스터 공간을 미리 준비
-  uint32_t *sp = (uint32_t *)&proc->stack[sizeof(proc->stack)];
-  *--sp = 0;            // s11
-  *--sp = 0;            // s10
-  *--sp = 0;            // s9
-  *--sp = 0;            // s8
-  *--sp = 0;            // s7
-  *--sp = 0;            // s6
-  *--sp = 0;            // s5
-  *--sp = 0;            // s4
-  *--sp = 0;            // s3
-  *--sp = 0;            // s2
-  *--sp = 0;            // s1
-  *--sp = 0;            // s0
-  *--sp = (uint32_t)pc; // ra (처음 실행 시 점프할 주소)
-
-  // 구조체 필드 초기화
-  proc->pid = i + 1;
-  proc->state = PROC_RUNNABLE;
-  proc->sp = (uint32_t)sp;
-  return proc;
-}
-
 void yield(void) {
   // 실행 가능한 프로세스 탐색
   struct process *next = idle_proc;
@@ -109,9 +73,13 @@ void yield(void) {
   // 예외가 발생했을 때의 스택 포인터를 신뢰할 수 없기에 매번 커널 스택의 최상위
   // 주소로 리셋
   __asm__ __volatile__(
+      "sfence.vma\n"
+      "csrw satp, %[satp]\n"
+      "sfence.vma\n"
       "csrw sscratch, %[sscratch]\n"
       :
-      : [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)]));
+      : [satp] "r"(SATP_SV32 | ((uint32_t)next->page_table / PAGE_SIZE)),
+        [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)]));
 
   struct process *prev = current_proc;
   current_proc = next;
@@ -248,7 +216,77 @@ paddr_t alloc_pages(uint32_t n) {
   return paddr;
 }
 
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+  if (!is_aligned(vaddr, PAGE_SIZE))
+    PANIC("unaligned vaddr $x", vaddr);
+
+  if (!is_aligned(paddr, PAGE_SIZE))
+    PANIC("unaligned paddr $x", paddr);
+
+  uint32_t vpn1 = (vaddr >> 22) & 0x3ff; // 1단계 페이지 테이블 인덱스 값
+  if ((table1[vpn1] & PAGE_V) == 0) {
+    // Create the non-existent 2nd level page table.
+    uint32_t pt_paddr = alloc_pages(1);
+    table1[vpn1] =
+        ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V; // save page number of 2nd
+  }
+
+  // Set the 2nd level page table entry to map the physical page.
+  uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+  uint32_t *table0 = (uint32_t *)((table1[vpn1] >> 10) * PAGE_SIZE);
+  table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+struct process *create_process(uint32_t pc) {
+  // 미사용(UNUSED) 상태의 프로세스 구조체 찾기
+  struct process *proc = NULL;
+  int i;
+  for (i = 0; i < PROCS_MAX; i++) {
+    if (procs[i].state == PROC_UNUSED) {
+      proc = &procs[i];
+      break;
+    }
+  }
+
+  if (!proc)
+    PANIC("no free process slots");
+
+  // 커널 스택에 callee-saved 레지스터 공간을 미리 준비
+  uint32_t *sp = (uint32_t *)&proc->stack[sizeof(proc->stack)];
+  *--sp = 0;            // s11
+  *--sp = 0;            // s10
+  *--sp = 0;            // s9
+  *--sp = 0;            // s8
+  *--sp = 0;            // s7
+  *--sp = 0;            // s6
+  *--sp = 0;            // s5
+  *--sp = 0;            // s4
+  *--sp = 0;            // s3
+  *--sp = 0;            // s2
+  *--sp = 0;            // s1
+  *--sp = 0;            // s0
+  *--sp = (uint32_t)pc; // ra (처음 실행 시 점프할 주소)
+
+  // Map kernel pages.
+  uint32_t *page_table = (uint32_t *)alloc_pages(1);
+  for (paddr_t paddr = (paddr_t)__kernel_base; paddr < (paddr_t)__free_ram_end;
+       paddr += PAGE_SIZE)
+    map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
+  // 구조체 필드 초기화
+  proc->pid = i + 1;
+  proc->state = PROC_RUNNABLE;
+  proc->sp = (uint32_t)sp;
+  proc->page_table = page_table;
+  return proc;
+}
+
 /////////////////////////////////////////////////////////////////////////////////////
+
+void delay(void) {
+  for (int i = 0; i < 30000000; i++)
+    __asm__ __volatile__("nop");
+}
 
 struct process *proc_a;
 struct process *proc_b;
@@ -257,6 +295,7 @@ void proc_a_entry(void) {
   printf("starting process A\n");
   while (1) {
     putchar('A');
+    delay();
     switch_context(&proc_a->sp, &proc_b->sp);
     yield();
   }
@@ -266,6 +305,7 @@ void proc_b_entry(void) {
   printf("starting process B\n");
   while (1) {
     putchar('B');
+    delay();
     switch_context(&proc_b->sp, &proc_a->sp);
     yield();
   }
