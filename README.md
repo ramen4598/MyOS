@@ -1,7 +1,7 @@
 # MyOS
 
-[참고 : 1000줄로  운영체제 구현하기](https://operating-system-in-1000-lines.vercel.app/en/)
-
+[튜토리얼 참고 : 1000줄로  운영체제 구현하기](https://operating-system-in-1000-lines.vercel.app/en/)
+[Repo 참고](https://github.com/nuta/operating-system-in-1000-lines)
 
 작은 운영체제를 처음부터 단계별로 구축.
 
@@ -27,6 +27,3 @@
 18. Outro
 
 ---
-License
-*.md in website directory: CC BY 4.0 license.
-Everything else: MIT license.
