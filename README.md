@@ -25,3 +25,8 @@
 16. Disk I/O
 17. File System
 18. Outro
+
+---
+License
+*.md in website directory: CC BY 4.0 license.
+Everything else: MIT license.
