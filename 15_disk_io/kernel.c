@@ -7,9 +7,13 @@ typedef unsigned int uint32_t;
 extern char __kernel_base[], __bss[], __bss_end[], __stack_top[], __free_ram[],
     __free_ram_end[], _binary_shell_bin_start[], _binary_shell_bin_size[];
 
-struct process procs[PROCS_MAX]; // 모든 프로세스 제어 구조체 배열
-struct process *current_proc;    // 현재 실행 중인 프로세스
-struct process *idle_proc;       // Idle 프로세스
+struct process procs[PROCS_MAX];     // 모든 프로세스 제어 구조체 배열
+struct process *current_proc;        // 현재 실행 중인 프로세스
+struct process *idle_proc;           // Idle 프로세스
+struct virtio_virtq *blk_request_vq; // disk io를 위한 virtqueue
+struct virtio_blk_req *blk_req;      // disk io를 위한 요청 구조체
+paddr_t blk_req_paddr;
+unsigned blk_capacity;
 
 ////////////////////////////////////////////////////////////////////////////////////
 
@@ -317,6 +321,9 @@ struct process *create_process(const void *image, size_t image_size) {
        paddr += PAGE_SIZE)
     map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
 
+  // Map MMIO pages.
+  map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
+
   // Map user pages.
   for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
     paddr_t page = alloc_pages(1);
@@ -340,12 +347,157 @@ struct process *create_process(const void *image, size_t image_size) {
 
 ////////////////////////////////////////////////////////////////////////////////////
 
+uint32_t virtio_reg_read32(unsigned offset) {
+  return *((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset));
+}
+
+uint64_t virtio_reg_read64(unsigned offset) {
+  return *((volatile uint64_t *)(VIRTIO_BLK_PADDR + offset));
+}
+
+void virtio_reg_write32(unsigned offset, uint32_t value) {
+  *((volatile uint32_t *)(VIRTIO_BLK_PADDR + offset)) = value;
+}
+
+void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value) {
+  virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+}
+
+struct virtio_virtq *virtq_init(unsigned index) {
+  // virtqueue를 위한 메모리 영역을 할당합니다.
+  paddr_t virtq_paddr =
+      alloc_pages(align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+  struct virtio_virtq *vq = (struct virtio_virtq *)virtq_paddr;
+  vq->queue_index = index;
+  vq->used_index = (volatile uint16_t *)&vq->used.index;
+
+  // 1. QueueSel 레지스터에 인덱스를 기록하여 큐 선택.
+  virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+  // 5. QueueNum 레지스터에 큐의 크기를 기록하여 장치에 알림.
+  virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+  // 6. QueueAlign 레지스터에 정렬값(바이트 단위)을 기록.
+  virtio_reg_write32(VIRTIO_REG_QUEUE_ALIGN, 0);
+  // 7. 할당한 큐 메모리의 첫 페이지의 물리적 번호를 QueuePFN 레지스터에 기록.
+  virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr);
+  return vq;
+}
+
+void virtio_blk_init(void) {
+  if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
+    PANIC("virtio: invalid magic value");
+  if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
+    PANIC("virtio: invalid version");
+  if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
+    PANIC("virtio: invalid device id");
+
+  // 1. 장치를 리셋합니다.
+  virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+  // 2. ACKNOWLEDGE 상태 비트를 설정합니다: 게스트 OS가 장치를 인식했음을 알림.
+  virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+  // 3. DRIVER 상태 비트를 설정합니다.
+  virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
+  // 5. FEATURES_OK 상태 비트를 설정합니다.
+  virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_FEAT_OK);
+  // 7. 장치별 설정 수행 (예, virtqueue 검색)
+  blk_request_vq = virtq_init(0);
+  // 8. DRIVER_OK 상태 비트를 설정합니다.
+  virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
+
+  // 디스크 용량을 가져옵니다.
+  blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+  printf("virtio-blk: capacity is %d bytes\n", blk_capacity);
+
+  // 장치에 요청(request)을 저장할 영역을 할당합니다.
+  blk_req_paddr =
+      alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+  blk_req = (struct virtio_blk_req *)blk_req_paddr;
+}
+
+// desc_index는 새로운 요청의 디스크립터 체인의 헤드 디스크립터 인덱스입니다.
+// 장치에 새로운 요청이 있음을 알립니다.
+void virtq_kick(struct virtio_virtq *vq, int desc_index) {
+  vq->avail.ring[vq->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
+  vq->avail.index++;
+  __sync_synchronize();
+  virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+  vq->last_used_index++;
+}
+
+// 장치가 요청을 처리 중인지 확인합니다.
+bool virtq_is_busy(struct virtio_virtq *vq) {
+  return vq->last_used_index != *vq->used_index;
+}
+
+// virtio-blk 장치로부터 읽기/쓰기를 수행합니다.
+void read_write_disk(void *buf, unsigned sector, int is_write) {
+
+  // sector가 (전체 용량/섹터 크기)보다 크다면 유효하지 않은 접근
+  if (sector >= blk_capacity / SECTOR_SIZE) {
+    printf("virtio: tried to read/write sector=%d, but capacity is %d\n",
+           sector, blk_capacity / SECTOR_SIZE);
+    return;
+  }
+
+  // virtio-blk 사양에 따라 요청을 구성합니다.
+  blk_req->sector = sector;
+  blk_req->type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+  if (is_write)
+    memcpy(blk_req->data, buf, SECTOR_SIZE);
+
+  // virtqueue 디스크립터를 구성합니다 (3개의 디스크립터 사용).
+  struct virtio_virtq *vq = blk_request_vq;
+  vq->descs[0].addr = blk_req_paddr;
+  vq->descs[0].len = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+  vq->descs[0].flags = VIRTQ_DESC_F_NEXT;
+  vq->descs[0].next = 1;
+
+  vq->descs[1].addr = blk_req_paddr + offsetof(struct virtio_blk_req, data);
+  vq->descs[1].len = SECTOR_SIZE;
+  vq->descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? 0 : VIRTQ_DESC_F_WRITE);
+  vq->descs[1].next = 2;
+
+  vq->descs[2].addr = blk_req_paddr + offsetof(struct virtio_blk_req, status);
+  vq->descs[2].len = sizeof(uint8_t);
+  vq->descs[2].flags = VIRTQ_DESC_F_WRITE;
+
+  // 장치에 새로운 요청이 있음을 알림.
+  virtq_kick(vq, 0);
+
+  // 장치가 요청 처리를 마칠 때까지 대기(바쁜 대기; busy-wait).
+  while (virtq_is_busy(vq))
+    ;
+
+  // virtio-blk: 0이 아닌 값이 반환되면 에러입니다.
+  if (blk_req->status != 0) {
+    printf("virtio: warn: failed to read/write sector=%d status=%d\n", sector,
+           blk_req->status);
+    return;
+  }
+
+  // 읽기 작업의 경우, 데이터를 버퍼에 복사합니다.
+  if (!is_write)
+    memcpy(buf, blk_req->data, SECTOR_SIZE);
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
 void kernel_main(void) {
   memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
 
   printf("\n\n");
 
   WRITE_CSR(stvec, (uint32_t)kernel_entry);
+
+  virtio_blk_init();
+
+  // disk io test start
+  char buf[SECTOR_SIZE];                                   // 추가
+  read_write_disk(buf, 0, false /* read from the disk */); // 추가
+  printf("first sector: %s\n", buf);                       // 추가
+
+  strcpy(buf, "hello from kernel!!!\n");                 // 추가
+  read_write_disk(buf, 0, true /* write to the disk */); // 추가
+  // disk io test end
 
   idle_proc = create_process(NULL, 0);
   idle_proc->pid = 0;
